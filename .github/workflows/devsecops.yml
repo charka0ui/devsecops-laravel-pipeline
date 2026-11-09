@@ -1,0 +1,210 @@
+# Pipeline DevSecOps : chaque push / pull request passe par 5 contrôles de sécurité.
+# Bonnes pratiques de chaîne d'approvisionnement appliquées au pipeline lui-même :
+#   - actions GitHub épinglées sur un SHA de commit (immuable) et non sur un tag
+#     (cf. compromission de trivy-action en mars 2026, CVE-2026-33634 : 76 tags réécrits) ;
+#   - binaires des scanners téléchargés en version fixe et vérifiés par empreinte SHA-256 ;
+#   - permissions minimales du GITHUB_TOKEN.
+name: DevSecOps pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  TRIVY_VERSION: "0.69.3" # version saine, antérieure à la version compromise 0.69.4
+  TRIVY_SHA256: "1816b632dfe529869c740c0913e36bd1629cb7688bd5634f4a858c1d57c88b75"
+  SEMGREP_VERSION: "1.184.0"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  secrets:
+    name: "1 · Secrets (Gitleaks)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0 # tout l'historique : un secret supprimé reste dans les anciens commits
+
+      - name: Installer Gitleaks (version fixe + vérification SHA-256)
+        run: |
+          curl -sSfL -o gitleaks.tgz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tgz" | sha256sum -c -
+          tar -xzf gitleaks.tgz gitleaks && sudo mv gitleaks /usr/local/bin/
+
+      - name: Scanner l'historique git
+        run: gitleaks git . --redact --verbose --report-format sarif --report-path gitleaks.sarif
+
+      - name: Publier les résultats (onglet Security)
+        if: always()
+        continue-on-error: true # nécessite un dépôt public (gratuit) ou GitHub Advanced Security
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+  # ---------------------------------------------------------------------------
+  sast:
+    name: "2 · SAST (Semgrep)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Installer Semgrep
+        run: pipx install "semgrep==${SEMGREP_VERSION}"
+
+      - name: Analyse statique (règles Laravel maison + règles communautaires PHP)
+        run: |
+          semgrep scan \
+            --config .semgrep/ \
+            --config p/php \
+            --metrics=off \
+            --sarif --output semgrep.sarif \
+            --error
+      - name: Afficher les résultats lisiblement
+        if: always()
+        run: semgrep scan --config .semgrep/ --config p/php --metrics=off || true
+
+      - name: Publier les résultats (onglet Security)
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  # ---------------------------------------------------------------------------
+  sca:
+    name: "3 · Dépendances (composer audit + Trivy)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: "8.2"
+          tools: composer:v2
+
+      - name: Installer les dépendances (génère composer.lock s'il est absent)
+        run: composer install --no-interaction --no-scripts --prefer-dist
+
+      - name: Conserver composer.lock (à commiter dans le dépôt)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: composer-lock
+          path: composer.lock
+          if-no-files-found: ignore
+
+      - name: Installer Trivy (version fixe + vérification SHA-256)
+        run: |
+          curl -sSfL -o trivy.tgz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c -
+          tar -xzf trivy.tgz trivy && sudo mv trivy /usr/local/bin/
+
+      - name: composer audit (base d'avis de sécurité Packagist / GitHub)
+        id: audit
+        continue-on-error: true
+        run: composer audit --format=plain
+
+      - name: Trivy — vulnérabilités des dépendances (composer.lock)
+        id: trivyfs
+        continue-on-error: true
+        run: |
+          trivy fs --scanners vuln --severity HIGH,CRITICAL --format sarif --output trivy-deps.sarif .
+          trivy fs --scanners vuln --severity HIGH,CRITICAL --exit-code 1 .
+
+      - name: Publier les résultats (onglet Security)
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: trivy-deps.sarif
+          category: trivy-dependencies
+
+      - name: Verdict
+        if: steps.audit.outcome == 'failure' || steps.trivyfs.outcome == 'failure'
+        run: |
+          echo "::error::Dépendances vulnérables détectées (ex. laravel/framework 10.48.22 -> CVE-2024-52301)."
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  container:
+    name: "4 · Conteneur (Trivy) + 5 · DAST (OWASP ZAP)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Installer Trivy (version fixe + vérification SHA-256)
+        run: |
+          curl -sSfL -o trivy.tgz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c -
+          tar -xzf trivy.tgz trivy && sudo mv trivy /usr/local/bin/
+
+      - name: Trivy — mauvaises configurations du Dockerfile
+        id: misconfig
+        continue-on-error: true
+        run: trivy config --severity HIGH,CRITICAL --exit-code 1 .
+
+      - name: Construire l'image
+        run: docker build -t techshop:${{ github.sha }} .
+
+      - name: Trivy — vulnérabilités de l'image
+        id: image
+        continue-on-error: true
+        run: |
+          trivy image --severity HIGH,CRITICAL --ignore-unfixed --format sarif --output trivy-image.sarif techshop:${{ github.sha }}
+          trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 techshop:${{ github.sha }}
+
+      - name: Publier les résultats (onglet Security)
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Démarrer l'application
+        run: |
+          docker run -d --name techshop -p 8000:8000 techshop:${{ github.sha }}
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/ > /dev/null && echo "Application prête" && exit 0
+            sleep 2
+          done
+          docker logs techshop
+          exit 1
+
+      - name: OWASP ZAP — scan dynamique (baseline)
+        uses: zaproxy/action-baseline@de8ad967d3548d44ef623df22cf95c3b0baf8b25 # v0.15.0
+        with:
+          target: "http://localhost:8000"
+          allow_issue_writing: false
+          fail_action: false # rapport informatif : le scan passif ne bloque pas le pipeline
+          artifact_name: zap-report
+
+      - name: Verdict
+        if: steps.misconfig.outcome == 'failure' || steps.image.outcome == 'failure'
+        run: |
+          echo "::error::Problèmes de sécurité dans l'image ou le Dockerfile (ex. conteneur exécuté en root)."
+          exit 1

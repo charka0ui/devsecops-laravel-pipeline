@@ -1,0 +1,8 @@
+.git
+.github
+vendor
+node_modules
+database/database.sqlite
+storage/logs/*
+*.sarif
+reports/

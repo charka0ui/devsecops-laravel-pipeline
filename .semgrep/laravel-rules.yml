@@ -1,0 +1,81 @@
+# Règles Semgrep personnalisées pour Laravel.
+# Écrites pour ce projet, en complément des règles de la communauté (p/php, p/secrets).
+rules:
+  - id: laravel-sqli-raw-query-concatenation
+    languages: [php]
+    severity: ERROR
+    message: >-
+      Injection SQL : une variable est concaténée dans une requête brute ($METHOD).
+      Utiliser des requêtes préparées (DB::select('... WHERE name LIKE ?', ["%$q%"])) ou Eloquent.
+    metadata:
+      cwe: "CWE-89: Improper Neutralization of Special Elements used in an SQL Command"
+      owasp: "A03:2021 - Injection"
+    pattern-either:
+      - patterns:
+          - pattern: DB::$METHOD($A . $B, ...)
+          - metavariable-regex:
+              metavariable: $METHOD
+              regex: ^(select|statement|unprepared|insert|update|delete|raw)$
+      - patterns:
+          - pattern: $QB->$METHOD($A . $B, ...)
+          - metavariable-regex:
+              metavariable: $METHOD
+              regex: ^(whereRaw|orWhereRaw|selectRaw|havingRaw|orderByRaw|groupByRaw)$
+
+  - id: laravel-path-traversal-download
+    languages: [php]
+    severity: ERROR
+    message: >-
+      Path traversal : un chemin construit par concaténation est passé à une fonction de lecture/téléchargement.
+      Valider le nom de fichier (basename + liste blanche) ou utiliser Storage::disk()->download().
+    metadata:
+      cwe: "CWE-22: Improper Limitation of a Pathname to a Restricted Directory"
+      owasp: "A01:2021 - Broken Access Control"
+    pattern-either:
+      - pattern: response()->download(storage_path($A . $B), ...)
+      - pattern: response()->download($A . $B, ...)
+      - pattern: response()->file($A . $B, ...)
+      - pattern: file_get_contents(storage_path($A . $B))
+
+  - id: laravel-blade-unescaped-output
+    languages: [generic]
+    severity: WARNING
+    message: >-
+      XSS : la syntaxe Blade {!! !!} affiche une valeur sans échappement HTML.
+      Utiliser {{ }} (échappement automatique) sauf pour du HTML de confiance.
+    metadata:
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation"
+      owasp: "A03:2021 - Injection"
+    paths:
+      include:
+        - "*.blade.php"
+    pattern-regex: '\{!!\s*\$[^}]*!!\}'
+
+  - id: laravel-debug-enabled
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      APP_DEBUG=true : en production, Laravel affiche les stack traces et des variables d'environnement
+      (secrets inclus) en cas d'erreur. Mettre APP_DEBUG=false.
+    metadata:
+      cwe: "CWE-489: Active Debug Code"
+      owasp: "A05:2021 - Security Misconfiguration"
+    paths:
+      include:
+        - ".env"
+    pattern-regex: '(?m)^APP_DEBUG\s*=\s*true'
+
+  - id: frontend-hardcoded-secret
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      Secret exposé côté client : ce fichier JavaScript est téléchargé par le navigateur, donc lisible par tout le monde.
+      Garder les secrets côté serveur et exposer uniquement une API ou des URL pré-signées.
+    metadata:
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      owasp: "A07:2021 - Identification and Authentication Failures"
+    paths:
+      include:
+        - "public/**/*.js"
+        - "resources/js/**/*.js"
+    pattern-regex: '(?i)(api[_-]?key|secret|password|token)\s*[:=]\s*["''][^"'']{8,}["'']'
